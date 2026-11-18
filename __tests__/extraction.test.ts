@@ -14774,6 +14774,185 @@ main = print (Just 42)
       expect(refs.length).toBeGreaterThan(0);
     });
   });
+
+  it('should keep let/where bindings out of the symbol table', () => {
+    const code = `module M where
+
+run :: IO ()
+run = do
+  let z = 1
+  print (z + w)
+  where
+    w = 2
+    go n = n
+`;
+    const result = extractFromSource('src/M.hs', code);
+    const fns = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+    expect(fns).toEqual(['run']);
+  });
+
+  describe('Call graph', () => {
+    let tempDir: string;
+    let cg: CodeGraph | undefined;
+    afterEach(() => {
+      cg?.close();
+      cg = undefined;
+      if (tempDir) cleanupTempDir(tempDir);
+    });
+
+    async function indexModules(modules: Record<string, string>): Promise<CodeGraph> {
+      tempDir = createTempDir();
+      for (const [file, source] of Object.entries(modules)) {
+        fs.mkdirSync(path.dirname(path.join(tempDir, file)), { recursive: true });
+        fs.writeFileSync(path.join(tempDir, file), source);
+      }
+      cg = CodeGraph.initSync(tempDir);
+      await cg.indexAll();
+      cg.resolveReferences();
+      return cg;
+    }
+
+    function fnNode(graph: CodeGraph, file: string, name: string) {
+      const node = graph.getNodesInFile(file).find((n) => n.kind === 'function' && n.name === name);
+      expect(node, `${file}:${name}`).toBeDefined();
+      return node!;
+    }
+
+    /** `file:fn` of every caller of `name` defined in `file`. */
+    function callersOf(graph: CodeGraph, file: string, name: string): string[] {
+      return graph.getCallers(fnNode(graph, file, name).id).map((c) => `${c.node.filePath}:${c.node.name}`).sort();
+    }
+
+    /** `file:fn` of every callee of `name` defined in `file`. */
+    function calleesOf(graph: CodeGraph, file: string, name: string): string[] {
+      return graph.getCallees(fnNode(graph, file, name).id).map((c) => `${c.node.filePath}:${c.node.name}`).sort();
+    }
+
+    const LIB = `module Lib where
+
+f :: Int -> Int
+f x = x + 1
+
+g :: Int -> Int
+g x = x * 2
+
+h :: Int -> Int
+h x = x
+`;
+    // Same names as Lib, never imported by Use: must never be linked.
+    const OTHER = `module Other where
+
+f :: Int -> Int
+f x = x - 1
+
+g :: Int -> Int
+g x = x
+
+pure :: a -> a
+pure x = x
+
+show :: Int -> Int
+show x = x
+`;
+    const USE = `module Use where
+
+import Lib as L
+import qualified Q as QQ
+import qualified Q2
+import Q3 as Al
+
+plainApp = f 1
+dollar = h $ g 1
+mapPartial = map (f 1) [1]
+bindStmt = do
+  y <- f 1
+  print y
+bindPure = do
+  y <- pure (f 1)
+  print (show y)
+nestedCase m = case m of
+  Just v -> do
+    r <- g v
+    print r
+  Nothing -> pure ()
+thenStmt = do
+  f 1 >>= print
+  h 2
+letInDo = do
+  let z = f 1
+  print z
+whereDo = do
+  print w
+  where w = g 1
+compose = f . g
+fmapped m = h <$> m
+mapArg xs = map g xs
+qualAlias = QQ.qtarget 1
+qualPlain = Q2.q2target 1
+asAlias = Al.q3target 1
+asAliasUnqualified = q3target 1
+shadowed f = f 1
+`;
+    const QS = {
+      'src/Q.hs': 'module Q where\n\nqtarget :: Int -> Int\nqtarget x = x\n',
+      'src/Q2.hs': 'module Q2 where\n\nq2target :: Int -> Int\nq2target x = x\n',
+      'src/Q3.hs': 'module Q3 where\n\nq3target :: Int -> Int\nq3target x = x\n',
+    };
+
+    it('links every call shape to the enclosing top-level function', async () => {
+      const graph = await indexModules({ 'src/Lib.hs': LIB, 'src/Other.hs': OTHER, 'src/Use.hs': USE, ...QS });
+      const callers = (name: string) => callersOf(graph, 'src/Lib.hs', name).map((c) => c.replace('src/Use.hs:', ''));
+      // f: plain application, `map (f 1)`, do-binds (bare and under `pure`),
+      // `f 1 >>= …`, `let` in `do`, composition operand.
+      expect(callers('f')).toEqual(['bindPure', 'bindStmt', 'compose', 'letInDo', 'mapPartial', 'plainApp', 'thenStmt']);
+      // g: right of `$`, nested `Just v -> do r <- g v`, `where` of a do-body,
+      // composition operand, `map g xs` argument.
+      expect(callers('g')).toEqual(['compose', 'dollar', 'mapArg', 'nestedCase', 'whereDo']);
+      // h: left of `$`, `<$>` operand, last do-statement.
+      expect(callers('h')).toEqual(['dollar', 'fmapped', 'thenStmt']);
+    });
+
+    it('resolves qualified and aliased calls through the imports', async () => {
+      const graph = await indexModules({ 'src/Lib.hs': LIB, 'src/Use.hs': USE, ...QS });
+      expect(callersOf(graph, 'src/Q.hs', 'qtarget')).toEqual(['src/Use.hs:qualAlias']);
+      expect(callersOf(graph, 'src/Q2.hs', 'q2target')).toEqual(['src/Use.hs:qualPlain']);
+      expect(callersOf(graph, 'src/Q3.hs', 'q3target')).toEqual(['src/Use.hs:asAlias', 'src/Use.hs:asAliasUnqualified']);
+    });
+
+    it('never links a namesake in a module the caller does not import', async () => {
+      const graph = await indexModules({ 'src/Lib.hs': LIB, 'src/Other.hs': OTHER, 'src/Use.hs': USE, ...QS });
+      for (const name of ['f', 'g', 'pure', 'show']) {
+        expect(callersOf(graph, 'src/Other.hs', name), name).toEqual([]);
+      }
+      // `pure`/`show` are Prelude's here: unresolved, not some project definition.
+      expect(calleesOf(graph, 'src/Use.hs', 'bindPure')).toEqual(['src/Lib.hs:f']);
+      // A parameter shadows the top-level function of its name.
+      expect(calleesOf(graph, 'src/Use.hs', 'shadowed')).toEqual([]);
+    });
+
+    it('limits resolution to what import lists admit, and follows re-exports', async () => {
+      const graph = await indexModules({
+        'src/Lib.hs': LIB,
+        'src/Other.hs': OTHER,
+        'src/Prelude2.hs': 'module Prelude2 (module Lib, module Other) where\n\nimport Lib (h)\nimport Other hiding (f, g)\n',
+        'src/Lists.hs': `module Lists where
+
+import Lib hiding (f)
+import Other (f)
+
+useF = f 1
+useG = g 1
+`,
+        'src/ViaPrelude.hs': 'module ViaPrelude where\n\nimport Prelude2\n\nuseH = h 1\nuseShow = show 1\nuseF = f 1\n',
+      });
+      expect(calleesOf(graph, 'src/Lists.hs', 'useF')).toEqual(['src/Other.hs:f']);
+      expect(calleesOf(graph, 'src/Lists.hs', 'useG')).toEqual(['src/Lib.hs:g']);
+      expect(calleesOf(graph, 'src/ViaPrelude.hs', 'useH')).toEqual(['src/Lib.hs:h']);
+      expect(calleesOf(graph, 'src/ViaPrelude.hs', 'useShow')).toEqual(['src/Other.hs:show']);
+      // Prelude2 imports neither Lib's nor Other's `f`, so it re-exports none.
+      expect(calleesOf(graph, 'src/ViaPrelude.hs', 'useF')).toEqual([]);
+    });
+  });
 });
 
 // `init` on a project CodeGraph has no grammar for used to look identical to a

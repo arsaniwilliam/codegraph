@@ -11,10 +11,23 @@ import type { LanguageExtractor, ExtractorContext } from '../tree-sitter-types';
 // dispatched through the visitNode hook below, mirroring the Erlang
 // extractor's approach.
 //
-// Calls are handled partly here (data constructor applications and infix
-// operators via the haskell branch in extractCall) and partly by the generic
-// call-extraction fallback (which reads the `function` field of `apply`
-// nodes — covering bare `fn x` and qualified `Mod.fn x` calls).
+// Calls live entirely here. Each top-level clause's body is walked by
+// visitBodyNode (the hook takes over every node under a body), which skips
+// pattern and type positions and records, against the enclosing top-level
+// function:
+//   - `calls` for an applied name: the head of an application (`f x`, `Q.f x`),
+//     a do-statement or bind right-hand side (`y <- act`, `act`), the left
+//     operand of `$` and the right operand of `&`, and non-builtin operators;
+//   - `function_ref` for a name used as a value — an argument (`map f xs`),
+//     an operand (`f . g`, `f <$> m`), a list/tuple element — the
+//     function-as-value convention (#756), which persists as `references`;
+//   - `instantiates` for data constructors, `references` for the constructors
+//     a pattern matches (`Just v -> …`).
+// let/where bindings are not symbols of their own: their calls belong to the
+// enclosing top-level function, and names a clause binds locally (parameters,
+// pattern variables, let/where names) are never recorded as references.
+// Which definition a name means is decided by the import-aware Haskell
+// resolver (src/resolution/haskell-scope.ts).
 
 /** Collapse runs of whitespace for one-line signatures. */
 function collapseWs(text: string): string {
@@ -56,13 +69,45 @@ function precedingHaddock(node: SyntaxNode, source: string): string | undefined 
   return undefined;
 }
 
+/** The name a binding-name node spells: `f`, or `<+>` for `(<+>)`. */
+function bindingName(nameNode: SyntaxNode, source: string): string {
+  if (nameNode.type === 'prefix_id') {
+    const op = nameNode.namedChild(0);
+    return op ? getNodeText(op, source) : '';
+  }
+  return getNodeText(nameNode, source);
+}
+
+/** A definition's unlabeled `infix` head — `a <+> b = …`, ``x `op` y = …``. */
+function infixHead(node: SyntaxNode): SyntaxNode | null {
+  for (let i = 0; i < node.childCount; i++) {
+    const child = node.child(i);
+    if (child?.type === 'infix' && node.fieldNameForChild(i) === null) return child;
+  }
+  return null;
+}
+
+/** The name a `function`/`bind` defines: its `name` field, or an infix definition's operator. */
+function definedName(node: SyntaxNode, source: string): string | null {
+  const nameNode = getChildByField(node, 'name');
+  if (nameNode) return bindingName(nameNode, source) || null;
+  const head = infixHead(node);
+  const op = head ? getChildByField(head, 'operator') : null;
+  if (!op) return null;
+  if (op.type === 'infix_id') {
+    const inner = op.namedChild(0);
+    return inner ? getNodeText(inner, source) : null;
+  }
+  return getNodeText(op, source) || null;
+}
+
 /** The preceding `signature` sibling (comments/haddocks may sit between), if it names this function. */
 function precedingSignature(node: SyntaxNode, name: string, source: string): SyntaxNode | null {
   let prev = node.previousNamedSibling;
   while (prev && (prev.type === 'comment' || prev.type === 'haddock')) prev = prev.previousNamedSibling;
   if (prev?.type === 'signature') {
     const sigName = getChildByField(prev, 'name');
-    if (sigName && getNodeText(sigName, source) === name) return prev;
+    if (sigName && bindingName(sigName, source) === name) return prev;
   }
   return null;
 }
@@ -88,24 +133,270 @@ function resetFnMemo(filePath: string): void {
   }
 }
 
-/** Walk a `match` node's expression subtree (and where-clause locals) for calls. */
-function visitMatch(matchNode: SyntaxNode, fnId: string, ctx: ExtractorContext): void {
-  ctx.pushScope(fnId);
-  // The match node itself holds the expression (field `expression`) and
-  // optional guards. Walk all named children so guards, the body expression,
-  // and any local-binds are all covered.
-  for (let i = 0; i < matchNode.namedChildCount; i++) {
-    const child = matchNode.namedChild(i);
-    if (child) ctx.visitNode(child);
-  }
-  ctx.popScope();
+// --- Calls and value references inside function bodies. ---
+
+/**
+ * Infix operators that are always built-in (never a user-defined function),
+ * so a call edge would never resolve. User-defined operators are NOT in this
+ * set and DO get a call edge.
+ */
+const BUILTIN_OPS = new Set([
+  '+', '-', '*', '/', '^', '^^', '**',
+  '==', '/=', '<', '>', '<=', '>=',
+  '&&', '||', 'not',
+  '>>', '>>=', '<<', '<$>', '<*>', '<|', '|$', '$', '$!',
+  '.', '..', '++', '!!', ':',
+  '<>', '<$',
+]);
+
+/** Operators whose left operand is the function applied: `f $ x`. */
+const APPLIES_LEFT = new Set(['$', '$!']);
+/** Operators whose right operand is the function applied: `x & f`. */
+const APPLIES_RIGHT = new Set(['&']);
+
+/** Body nodes holding no references: type positions, raw quasiquote text, record field labels. */
+const SKIPPED_BODY_NODES = new Set(['type_application', 'quasiquote', 'pragma', 'comment', 'haddock', 'field_name']);
+
+/** Depth of top-level clause bodies being walked; > 0 routes the hook to visitBodyNode. */
+let bodyDepth = 0;
+/** Names the clause being walked binds locally (parameters, pattern variables, let/where names). */
+let bodyLocals: Set<string> | null = null;
+/** `function_ref`/`references` dedupe — one per (caller, name), as flushFnRefCandidates does. */
+let refFile = '';
+let refSeen = new Set<string>();
+
+/** Every name a top-level clause binds below its own name: what its body's names may mean locally. */
+function collectLocals(clause: SyntaxNode, source: string): Set<string> {
+  const locals = new Set<string>();
+  const addVariables = (node: SyntaxNode): void => {
+    if (node.type === 'variable') locals.add(getNodeText(node, source));
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      if (child) addVariables(child);
+    }
+  };
+  const scan = (node: SyntaxNode, top: boolean): void => {
+    const isDefinition = node.type === 'function' || node.type === 'bind';
+    for (let i = 0; i < node.childCount; i++) {
+      const child = node.child(i);
+      if (!child?.isNamed) continue;
+      const field = node.fieldNameForChild(i);
+      if (field === 'pattern' || field === 'patterns') {
+        addVariables(child);
+      } else if (isDefinition && field === 'name') {
+        if (!top) locals.add(bindingName(child, source));
+      } else if (isDefinition && field === null && child.type === 'infix') {
+        // `a <+> b = …`: the operands are the parameters.
+        for (const operand of [getChildByField(child, 'left_operand'), getChildByField(child, 'right_operand')]) {
+          if (operand) addVariables(operand);
+        }
+        const name = top ? null : definedName(node, source);
+        if (name) locals.add(name);
+      } else {
+        scan(child, false);
+      }
+    }
+  };
+  scan(clause, true);
+  return locals;
 }
 
-/** Handle a `function` or `bind` node (both are function definitions). */
+type RefKind = 'calls' | 'function_ref' | 'instantiates' | 'references';
+
+/** Record a reference from the enclosing symbol, unless it names a builtin operator or a local. */
+function emitRef(ctx: ExtractorContext, name: string, kind: RefKind, at: SyntaxNode): void {
+  const fromNodeId = ctx.nodeStack[ctx.nodeStack.length - 1];
+  if (!fromNodeId || !name || BUILTIN_OPS.has(name)) return;
+  if ((kind === 'calls' || kind === 'function_ref') && bodyLocals?.has(name)) return;
+  if (kind === 'function_ref' || kind === 'references') {
+    if (refFile !== ctx.filePath) {
+      refFile = ctx.filePath;
+      refSeen = new Set();
+    }
+    const key = `${kind}|${fromNodeId}|${name}`;
+    if (refSeen.has(key)) return;
+    refSeen.add(key);
+  }
+  ctx.addUnresolvedReference({
+    fromNodeId,
+    referenceName: name,
+    referenceKind: kind,
+    line: at.startPosition.row + 1,
+    column: at.startPosition.column,
+  });
+}
+
+/** A bare name expression — `f`, `M.f`, `Just`, `M.Just`, `(<+>)`, an operator — and whether it is a data constructor. */
+function bareName(node: SyntaxNode, source: string): { name: string; ctor: boolean } | null {
+  switch (node.type) {
+    case 'variable':
+    case 'operator':
+      return { name: getNodeText(node, source), ctor: false };
+    case 'constructor':
+    case 'constructor_operator':
+      return { name: getNodeText(node, source), ctor: true };
+    case 'qualified': {
+      const id = getChildByField(node, 'id');
+      if (!id) return null;
+      return { name: getNodeText(node, source), ctor: id.type === 'constructor' || id.type === 'constructor_operator' };
+    }
+    case 'prefix_id':
+    case 'infix_id': {
+      const inner = node.namedChild(0);
+      return inner ? bareName(inner, source) : null;
+    }
+    default:
+      return null;
+  }
+}
+
+/** Record `node` as a reference of `kind` if it is a bare name; otherwise walk it. */
+function visitOperand(ctx: ExtractorContext, node: SyntaxNode, kind: 'calls' | 'function_ref'): void {
+  const ref = bareName(node, ctx.source);
+  if (ref) emitRef(ctx, ref.name, ref.ctor ? 'instantiates' : kind, node);
+  else ctx.visitNode(node);
+}
+
+/** An operator in an infix expression or section is applied: a call (constructor operators instantiate). */
+function visitOperator(ctx: ExtractorContext, op: SyntaxNode): string {
+  const ref = bareName(op, ctx.source);
+  if (!ref) return '';
+  emitRef(ctx, ref.name, ref.ctor ? 'instantiates' : 'calls', op);
+  return ref.name;
+}
+
+/** A pattern binds names; the constructors it matches are `references` (`Just v -> …`). */
+function visitPattern(ctx: ExtractorContext, node: SyntaxNode): void {
+  const ref = bareName(node, ctx.source);
+  if (ref) {
+    if (ref.ctor) emitRef(ctx, ref.name, 'references', node);
+    return;
+  }
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    if (child) visitPattern(ctx, child);
+  }
+}
+
+/**
+ * A definition (`function`/`bind`) or do-statement bind, as code of the
+ * enclosing top-level function: patterns (an infix definition's operands
+ * included) for the constructors they match, then guards, right-hand sides and
+ * `where` binds. Its name is never a reference.
+ */
+function visitBinding(node: SyntaxNode, ctx: ExtractorContext): void {
+  for (let i = 0; i < node.childCount; i++) {
+    const child = node.child(i);
+    if (!child?.isNamed) continue;
+    const field = node.fieldNameForChild(i);
+    if (field === 'expression') visitOperand(ctx, child, 'calls');
+    else if (field === 'match' || field === 'binds') ctx.visitNode(child);
+    else if (field === 'pattern' || field === 'patterns') visitPattern(ctx, child);
+    else if (field === null && child.type === 'infix') {
+      for (const operand of [getChildByField(child, 'left_operand'), getChildByField(child, 'right_operand')]) {
+        if (operand) visitPattern(ctx, operand);
+      }
+    }
+  }
+}
+
+/** The hook while a top-level clause body is walked: every node under it comes here. */
+function visitBodyNode(node: SyntaxNode, ctx: ExtractorContext): boolean {
+  switch (node.type) {
+    case 'function':
+    case 'bind':
+      // A let/where binding or a do-statement `x <- act`, never a symbol of its
+      // own: its right-hand side belongs to the enclosing top-level function.
+      visitBinding(node, ctx);
+      return true;
+    case 'exp':
+      // A do-statement: a bare action is run.
+      for (let i = 0; i < node.namedChildCount; i++) {
+        const child = node.namedChild(i);
+        if (child) visitOperand(ctx, child, 'calls');
+      }
+      return true;
+    case 'apply': {
+      // `f a b` nests as apply(apply(f, a), b): the innermost apply names the head.
+      const fn = getChildByField(node, 'function');
+      if (fn) visitOperand(ctx, fn, 'calls');
+      for (const arg of node.childrenForFieldName('argument')) {
+        if (arg) visitOperand(ctx, arg, 'function_ref');
+      }
+      return true;
+    }
+    case 'infix': {
+      const op = getChildByField(node, 'operator');
+      const opName = op ? visitOperator(ctx, op) : '';
+      const left = getChildByField(node, 'left_operand');
+      const right = getChildByField(node, 'right_operand');
+      if (left) visitOperand(ctx, left, APPLIES_LEFT.has(opName) ? 'calls' : 'function_ref');
+      if (right) visitOperand(ctx, right, APPLIES_RIGHT.has(opName) ? 'calls' : 'function_ref');
+      return true;
+    }
+    case 'left_section':
+    case 'right_section': {
+      // `(f <$>)`, ``(`elem` xs)``, `(+ 1)`: the operator is applied, operands are values.
+      let opName = '';
+      const operands: Array<[SyntaxNode, string]> = [];
+      for (let i = 0; i < node.childCount; i++) {
+        const child = node.child(i);
+        if (!child?.isNamed) continue;
+        const field = node.fieldNameForChild(i);
+        if (field === 'left_operand' || field === 'right_operand') operands.push([child, field]);
+        else if (field === 'operator' || child.type === 'operator' || child.type === 'infix_id' || child.type === 'constructor_operator') {
+          opName = visitOperator(ctx, child);
+        } else ctx.visitNode(child);
+      }
+      for (const [operand, field] of operands) {
+        const applied = field === 'left_operand' ? APPLIES_LEFT.has(opName) : APPLIES_RIGHT.has(opName);
+        visitOperand(ctx, operand, applied ? 'calls' : 'function_ref');
+      }
+      return true;
+    }
+    case 'signature': {
+      // `(e :: T)` walks `e`; a local type signature holds no references.
+      const expr = getChildByField(node, 'expression');
+      if (expr) visitOperand(ctx, expr, 'function_ref');
+      return true;
+    }
+    case 'variable':
+    case 'qualified':
+    case 'constructor':
+    case 'prefix_id':
+      visitOperand(ctx, node, 'function_ref');
+      return true;
+    default:
+      if (SKIPPED_BODY_NODES.has(node.type)) return true;
+      for (let i = 0; i < node.childCount; i++) {
+        const child = node.child(i);
+        if (!child?.isNamed) continue;
+        const field = node.fieldNameForChild(i);
+        if (field === 'pattern' || field === 'patterns') visitPattern(ctx, child);
+        else if (field !== 'type') ctx.visitNode(child);
+      }
+      return true;
+  }
+}
+
+/** Walk one top-level clause (patterns, guards, body, `where` binds) as `fnId`'s code. */
+function walkClause(node: SyntaxNode, fnId: string, ctx: ExtractorContext): void {
+  const outerLocals = bodyLocals;
+  bodyLocals = collectLocals(node, ctx.source);
+  bodyDepth++;
+  ctx.pushScope(fnId);
+  try {
+    visitBinding(node, ctx);
+  } finally {
+    ctx.popScope();
+    bodyDepth--;
+    bodyLocals = outerLocals;
+  }
+}
+
+/** Handle a top-level (or class/instance member) `function` or `bind` node. */
 function handleFunctionLike(node: SyntaxNode, ctx: ExtractorContext): boolean {
-  const nameNode = getChildByField(node, 'name');
-  if (!nameNode) return true;
-  const name = getNodeText(nameNode, ctx.source);
+  const name = definedName(node, ctx.source);
   if (!name) return true;
 
   resetFnMemo(ctx.filePath);
@@ -123,18 +414,7 @@ function handleFunctionLike(node: SyntaxNode, ctx: ExtractorContext): boolean {
         break;
       }
     }
-    const match = getChildByField(node, 'match');
-    if (match) visitMatch(match, lastFnId, ctx);
-    // where-clause local binds (sibling `binds` field on the function node)
-    const binds = getChildByField(node, 'binds');
-    if (binds) {
-      ctx.pushScope(lastFnId);
-      for (let i = 0; i < binds.namedChildCount; i++) {
-        const child = binds.namedChild(i);
-        if (child) ctx.visitNode(child);
-      }
-      ctx.popScope();
-    }
+    walkClause(node, lastFnId, ctx);
     return true;
   }
 
@@ -149,18 +429,7 @@ function handleFunctionLike(node: SyntaxNode, ctx: ExtractorContext): boolean {
   lastFnScope = currentScope;
   lastFnId = fn.id;
 
-  const match = getChildByField(node, 'match');
-  if (match) visitMatch(match, fn.id, ctx);
-  // where-clause local binds
-  const binds = getChildByField(node, 'binds');
-  if (binds) {
-    ctx.pushScope(fn.id);
-    for (let i = 0; i < binds.namedChildCount; i++) {
-      const child = binds.namedChild(i);
-      if (child) ctx.visitNode(child);
-    }
-    ctx.popScope();
-  }
+  walkClause(node, fn.id, ctx);
   return true;
 }
 
@@ -318,7 +587,7 @@ export const haskellExtractor: LanguageExtractor = {
   enumTypes: [],
   typeAliasTypes: [],  // dispatched via visitNode
   importTypes: ['import'],
-  callTypes: ['apply', 'infix'],
+  callTypes: [],  // calls are recorded by visitBodyNode (see the header comment)
   variableTypes: [],
   nameField: 'name',
   bodyField: 'match',
@@ -347,10 +616,23 @@ export const haskellExtractor: LanguageExtractor = {
   },
 
   visitNode: (node, ctx) => {
+    if (bodyDepth > 0) return visitBodyNode(node, ctx);
     switch (node.type) {
       case 'function':
       case 'bind':
         return handleFunctionLike(node, ctx);
+      case 'top_splice':
+        // `makeLenses ''Foo` at the top level: the file's own code.
+        bodyDepth++;
+        try {
+          for (let i = 0; i < node.namedChildCount; i++) {
+            const child = node.namedChild(i);
+            if (child) ctx.visitNode(child);
+          }
+        } finally {
+          bodyDepth--;
+        }
+        return true;
       case 'signature':
         return true; // metadata for the following function — skip as a node
       case 'data_type':

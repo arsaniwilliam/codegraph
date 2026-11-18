@@ -47,6 +47,7 @@ import { isObjcDeclaredTypeRef, matchByExactName } from './name-matcher';
 import { pythonSelfCallReaches } from './name-matcher';
 import { clearCFeatureVariantMemos } from './c-feature-variants';
 import { clearAmbientModuleMemos, ambientModuleDeclarations } from './ambient-modules';
+import { resolveHaskellRef, clearHaskellScopeMemos } from './haskell-scope';
 import { matchShopifyThemeFile } from './shopify-themes';
 import { isJsSuperCallLanguage, isJsSuperCallSite, matchJsSuperCall } from './js-super-calls';
 import { CLASS_EXPRESSION_REF_LANGUAGES, isCommonJsExportedClass, isJsClassExpression, writtenIn, type ClassExpressionIndex } from './js-class-expressions';
@@ -843,6 +844,7 @@ export class ReferenceResolver {
       clearCFeatureVariantMemos(this.context);
       clearAmbientModuleMemos(this.context);
       clearPythonOverloadMemos(this.context);
+      clearHaskellScopeMemos(this.context);
       clearDeclaredDependencies(this.context);
     }
   }
@@ -1941,6 +1943,12 @@ export class ReferenceResolver {
     // to that local, whatever the file imports (see matchRustUseBoundName).
     const rustBound = matchRustUseBoundName(ref, this.context);
     if (rustBound !== undefined) return this.gateLanguage(rustBound, ref);
+
+    // A Haskell name means a definition of its own module or of a module it
+    // imports, under the import's `qualified`/`as` and import list, or nothing
+    // the project declares (see ./haskell-scope) — never a namesake elsewhere.
+    const haskellScoped = resolveHaskellRef(ref, this.context);
+    if (haskellScoped !== undefined) return this.gateLanguage(haskellScoped, ref);
 
     // Fast pre-filter: skip if no symbol with this name exists anywhere
     // AND the name doesn't match a local import. The import escape is
