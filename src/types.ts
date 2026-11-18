@@ -127,6 +127,7 @@ export const LANGUAGES = [
   'terraform',
   'haskell',
   'unknown',
+  'markdown',
 ] as const;
 
 export type Language = (typeof LANGUAGES)[number];

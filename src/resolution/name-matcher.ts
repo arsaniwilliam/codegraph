@@ -36439,6 +36439,19 @@ function overloadSetOf(id: string, context: ResolutionContext): { name: string; 
   return { name, own: arity(self), siblings: siblings.map((n) => ({ id: n.id, arity: arity(n) })) };
 }
 
+/**
+ * A Markdown link, which the extractor wrote as the project-relative
+ * `path.md` of a doc or `path.md#slug` of one of its sections: exactly the
+ * node of that qualified name, or nothing (a broken link must not fall
+ * through to the name-guessing strategies).
+ */
+export function matchMarkdownReference(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const target = context.getNodesByQualifiedName(ref.referenceName)
+    .find((n) => n.language === 'markdown' && (ref.referenceName.includes('#') ? n.kind !== 'file' : n.kind === 'file'));
+  if (!target) return null;
+  return { original: ref, targetNodeId: target.id, confidence: 1, resolvedBy: 'file-path' };
+}
+
 function matchReferenceInner(
   ref: UnresolvedRef,
   context: ResolutionContext

@@ -228,7 +228,7 @@ describe('Language Detection', () => {
     expect(detectLanguage('src/Data/Map.hs')).toBe('haskell');
     expect(isSourceFile('app/Main.hs')).toBe(true);
     expect(isSourceFile('app/Main.lhs')).toBe(true);
-    expect(isSourceFile('README.md')).toBe(false);
+    expect(isSourceFile('notes.txt')).toBe(false);
   });
 
   it('should detect a .h whose only C++ signal is an export-macro class as cpp', () => {

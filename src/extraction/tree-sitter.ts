@@ -34,6 +34,7 @@ import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
 import { AstroExtractor } from './astro-extractor';
 import { DfmExtractor } from './dfm-extractor';
+import { MarkdownExtractor } from './markdown-extractor';
 import { PASCAL_SYSTEM_NAMES } from './languages/pascal-system';
 import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
@@ -10200,6 +10201,10 @@ export function extractFromSource(
   } else if (detectedLanguage === 'razor') {
     // Use custom extractor for ASP.NET Razor (.cshtml) / Blazor (.razor) markup
     const extractor = new RazorExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'markdown') {
+    // Custom extractor for Markdown: one node per heading, references per `.md` link.
+    const extractor = new MarkdownExtractor(filePath, source);
     result = extractor.extract();
   } else if (detectedLanguage === 'xml') {
     // Custom extractor for MyBatis mapper XML. Non-mapper XML returns just a

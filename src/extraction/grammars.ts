@@ -12,7 +12,7 @@ import * as fsp from 'fs/promises';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
 import { ExtractionError, Language } from '../types';
 
-export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'astro' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'unknown'>;
+export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'astro' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'markdown' | 'unknown'>;
 
 /**
  * WASM filename map — maps each language to its .wasm grammar file
@@ -175,6 +175,8 @@ export const EXTENSION_MAP: Record<string, Language> = {
   // Haskell — vendored grammar from tree-sitter-haskell 0.23.1 (ABI 14).
   '.hs': 'haskell',
   '.lhs': 'haskell',
+  // Markdown: sections (ATX headings) and `.md` links — MarkdownExtractor.
+  '.md': 'markdown',
 };
 
 /** MPEG transport stream: fixed 188-byte packets, each opening with 0x47. */
@@ -821,6 +823,7 @@ export function isLanguageSupported(language: Language): boolean {
   if (language === 'twig') return true; // file-level tracking only
   if (language === 'xml') return true; // MyBatis mapper extractor
   if (language === 'properties') return true; // Spring config keys
+  if (language === 'markdown') return true; // MarkdownExtractor (headings + links)
   if (language === 'unknown') return false;
   return language in WASM_GRAMMAR_FILES;
 }
@@ -831,7 +834,7 @@ export function isLanguageSupported(language: Language): boolean {
 export function isGrammarLoaded(language: Language): boolean {
   if (language === 'svelte' || language === 'vue' || language === 'astro' || language === 'liquid' || language === 'razor') return true;
   if (language === 'yaml' || language === 'twig') return true; // no WASM grammar needed
-  if (language === 'xml' || language === 'properties') return true; // no WASM grammar needed
+  if (language === 'xml' || language === 'properties' || language === 'markdown') return true; // no WASM grammar needed
   return languageCache.has(language);
 }
 
@@ -966,6 +969,7 @@ export function getLanguageDisplayName(language: Language): string {
     arkts: 'ArkTS',
     haskell: 'Haskell',
     unknown: 'Unknown',
+    markdown: 'Markdown',
   };
   return names[language] || language;
 }
