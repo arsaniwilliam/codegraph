@@ -433,12 +433,13 @@ function handleFunctionLike(node: SyntaxNode, ctx: ExtractorContext): boolean {
   return true;
 }
 
-/** Handle a `data_type` node — struct + constructors (enum_members) + record fields. */
-function handleDataType(node: SyntaxNode, ctx: ExtractorContext): boolean {
+/** Handle a `data_type` node — struct + constructors (enum_members) + record fields.
+ *  `name` overrides the struct's name (a data family instance's, see handleDataInstance). */
+function handleDataType(node: SyntaxNode, ctx: ExtractorContext, name?: string): boolean {
   const nameNode = getChildByField(node, 'name');
   if (!nameNode) return true;
   const doc = precedingHaddock(node, ctx.source);
-  const struct = ctx.createNode('struct', getNodeText(nameNode, ctx.source), node, {
+  const struct = ctx.createNode('struct', name ?? getNodeText(nameNode, ctx.source), node, {
     docstring: doc,
     signature: collapseWs(getNodeText(node, ctx.source)).slice(0, 300),
   });
@@ -477,11 +478,12 @@ function handleDataType(node: SyntaxNode, ctx: ExtractorContext): boolean {
   return true; // don't descend into type-position expressions
 }
 
-/** Handle a `newtype` node — struct + single constructor + field. */
-function handleNewtype(node: SyntaxNode, ctx: ExtractorContext): boolean {
+/** Handle a `newtype` node — struct + single constructor + field.
+ *  `name` overrides the struct's name (a data family instance's, see handleDataInstance). */
+function handleNewtype(node: SyntaxNode, ctx: ExtractorContext, name?: string): boolean {
   const nameNode = getChildByField(node, 'name');
   if (!nameNode) return true;
-  const struct = ctx.createNode('struct', getNodeText(nameNode, ctx.source), node, {
+  const struct = ctx.createNode('struct', name ?? getNodeText(nameNode, ctx.source), node, {
     docstring: precedingHaddock(node, ctx.source),
     signature: collapseWs(getNodeText(node, ctx.source)).slice(0, 300),
   });
@@ -510,6 +512,65 @@ function handleTypeSynonym(node: SyntaxNode, ctx: ExtractorContext): boolean {
     signature: collapseWs(getNodeText(node, ctx.source)).slice(0, 200),
   });
   return true; // the type body is type-position — don't descend
+}
+
+/**
+ * Handle a `type_family` / `data_family` declaration, top-level or associated
+ * (`type F a :: Type`, `data D a` in a class body). Indexed like the type
+ * synonym / data type it stands for: `type_alias` and `struct`.
+ */
+function handleFamily(node: SyntaxNode, ctx: ExtractorContext, kind: 'type_alias' | 'struct'): boolean {
+  const nameNode = getChildByField(node, 'name');
+  if (!nameNode) return true;
+  ctx.createNode(kind, getNodeText(nameNode, ctx.source), node, {
+    docstring: precedingHaddock(node, ctx.source),
+    signature: collapseWs(getNodeText(node, ctx.source)).slice(0, 200),
+  });
+  return true; // kind signature, equations: type positions — don't descend
+}
+
+/** `implements` from the enclosing symbol to the family a type/data instance instantiates. */
+function referenceFamily(nameNode: SyntaxNode, node: SyntaxNode, ctx: ExtractorContext): void {
+  const fromNodeId = ctx.nodeStack[ctx.nodeStack.length - 1];
+  if (!fromNodeId) return;
+  ctx.addUnresolvedReference({
+    fromNodeId,
+    referenceName: getNodeText(nameNode, ctx.source),
+    referenceKind: 'implements',
+    line: node.startPosition.row + 1,
+    column: node.startPosition.column,
+  });
+}
+
+/**
+ * Handle a `type_instance` node (`type F Foo = …`, `type instance F Foo = …`):
+ * a reference to the family, so its usages are reachable. A default in a class
+ * body (`type F a = …`) restates the family declared there: nothing to link.
+ */
+function handleTypeInstance(node: SyntaxNode, ctx: ExtractorContext): boolean {
+  if (node.parent?.type === 'class_declarations') return true;
+  const nameNode = getChildByField(node, 'name');
+  if (nameNode) referenceFamily(nameNode, node, ctx);
+  return true;
+}
+
+/**
+ * Handle a `data_instance` node (`data`/`newtype` `F Foo = …`, with or without
+ * `instance`): a reference to the family, plus a struct for the instance with
+ * its constructors and fields. The struct is named `Family.Patterns`, as an
+ * instance's class node is (`Shape.Circle`): sharing the family's name, it
+ * would be taken for the family itself.
+ */
+function handleDataInstance(node: SyntaxNode, ctx: ExtractorContext): boolean {
+  const body = node.namedChildren.find((c) => c.type === 'data_type' || c.type === 'newtype');
+  if (!body) return true;
+  const nameNode = getChildByField(body, 'name');
+  if (!nameNode) return true;
+  referenceFamily(nameNode, node, ctx);
+  const patterns = getChildByField(body, 'patterns');
+  const family = getNodeText(nameNode, ctx.source);
+  const name = patterns ? `${family}.${collapseWs(getNodeText(patterns, ctx.source))}` : family;
+  return body.type === 'newtype' ? handleNewtype(body, ctx, name) : handleDataType(body, ctx, name);
 }
 
 /** Handle a `class` node — trait + default method implementations. */
@@ -641,6 +702,14 @@ export const haskellExtractor: LanguageExtractor = {
         return handleNewtype(node, ctx);
       case 'type_synomym':
         return handleTypeSynonym(node, ctx);
+      case 'type_family':
+        return handleFamily(node, ctx, 'type_alias');
+      case 'data_family':
+        return handleFamily(node, ctx, 'struct');
+      case 'type_instance':
+        return handleTypeInstance(node, ctx);
+      case 'data_instance':
+        return handleDataInstance(node, ctx);
       case 'class':
         return handleClass(node, ctx);
       case 'instance':

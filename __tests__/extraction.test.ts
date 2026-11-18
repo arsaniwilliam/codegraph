@@ -14682,6 +14682,111 @@ instance Shape Square where
     });
   });
 
+  describe('Type and data family extraction', () => {
+    it('should extract associated type and data families of a class', () => {
+      const code = `module M where
+
+class ESField f where
+  type ESFieldType f :: Type
+  data ESFieldValue f
+  type ESFieldPath f
+  type ESFieldPath f = ""
+  esFieldName :: Text
+`;
+      const result = extractFromSource('src/M.hs', code);
+      const cls = result.nodes.find((n) => n.kind === 'trait' && n.name === 'ESField');
+      const fieldType = result.nodes.find((n) => n.kind === 'type_alias' && n.name === 'ESFieldType');
+      expect(fieldType).toBeDefined();
+      expect(fieldType?.qualifiedName).toBe('M::ESField::ESFieldType');
+      expect(fieldType?.signature).toBe('type ESFieldType f :: Type');
+      const fieldValue = result.nodes.find((n) => n.kind === 'struct' && n.name === 'ESFieldValue');
+      expect(fieldValue).toBeDefined();
+      expect(fieldValue?.qualifiedName).toBe('M::ESField::ESFieldValue');
+      for (const fam of [fieldType, fieldValue]) {
+        expect(result.edges.some((e) => e.kind === 'contains' && e.source === cls!.id && e.target === fam!.id)).toBe(true);
+      }
+      // `type ESFieldPath f = ""` is the family's default, not a second declaration or a usage.
+      expect(result.nodes.filter((n) => n.name === 'ESFieldPath')).toHaveLength(1);
+      expect(result.unresolvedReferences.filter((r) => r.referenceName === 'ESFieldPath')).toHaveLength(0);
+    });
+
+    it('should extract top-level type and data families', () => {
+      const code = `module M where
+
+type family Open a
+type family Closed a where
+  Closed Int = Bool
+data family Vec a
+`;
+      const result = extractFromSource('src/M.hs', code);
+      expect(result.nodes.find((n) => n.kind === 'type_alias' && n.name === 'Open')?.qualifiedName).toBe('M::Open');
+      expect(result.nodes.find((n) => n.kind === 'type_alias' && n.name === 'Closed')).toBeDefined();
+      expect(result.nodes.find((n) => n.kind === 'struct' && n.name === 'Vec')?.qualifiedName).toBe('M::Vec');
+    });
+
+    it('should reference the family from associated type and data instances', () => {
+      const code = `module M where
+
+class ESField f where
+  type ESFieldType f :: Type
+  data ESFieldValue f
+
+instance ESField Id where
+  type ESFieldType Id = Word
+  newtype ESFieldValue Id = MkId Word
+
+instance ESField Name where
+  type ESFieldType Name = Text
+  data ESFieldValue Name = MkName Text | NoName
+`;
+      const result = extractFromSource('src/M.hs', code);
+      const idInst = result.nodes.find((n) => n.kind === 'class' && n.name === 'ESField.Id')!;
+      const nameInst = result.nodes.find((n) => n.kind === 'class' && n.name === 'ESField.Name')!;
+      const refsFrom = (id: string, name: string) =>
+        result.unresolvedReferences.filter(
+          (r) => r.fromNodeId === id && r.referenceName === name && r.referenceKind === 'implements',
+        );
+      expect(refsFrom(idInst.id, 'ESFieldType')).toHaveLength(1);
+      expect(refsFrom(idInst.id, 'ESFieldValue')).toHaveLength(1);
+      expect(refsFrom(nameInst.id, 'ESFieldType')).toHaveLength(1);
+      expect(refsFrom(nameInst.id, 'ESFieldValue')).toHaveLength(1);
+      // The class instance still implements the class.
+      expect(refsFrom(idInst.id, 'ESField')).toHaveLength(1);
+
+      // The family is the only node named after it; its instances are `Family.Type` structs
+      // that keep their constructors.
+      expect(result.nodes.filter((n) => n.name === 'ESFieldType')).toHaveLength(1);
+      expect(result.nodes.filter((n) => n.name === 'ESFieldValue')).toHaveLength(1);
+      expect(result.nodes.find((n) => n.kind === 'struct' && n.name === 'ESFieldValue.Id')).toBeDefined();
+      expect(result.nodes.find((n) => n.kind === 'struct' && n.name === 'ESFieldValue.Name')).toBeDefined();
+      expect(result.nodes.filter((n) => n.kind === 'enum_member').map((n) => n.name)).toEqual(
+        expect.arrayContaining(['MkId', 'MkName', 'NoName']),
+      );
+    });
+
+    it('should reference the family from top-level type and data instances', () => {
+      const code = `module M where
+
+type family Open a
+data family Vec a
+
+type instance Open Int = Bool
+data instance Vec Int = VInt [Int]
+newtype instance Vec Bool = VBool Integer
+`;
+      const result = extractFromSource('src/M.hs', code);
+      const ns = result.nodes.find((n) => n.kind === 'namespace' && n.name === 'M')!;
+      const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'implements');
+      expect(refs.filter((r) => r.referenceName === 'Open').map((r) => r.fromNodeId)).toEqual([ns.id]);
+      expect(refs.filter((r) => r.referenceName === 'Vec')).toHaveLength(2);
+      expect(result.nodes.filter((n) => n.name === 'Vec')).toHaveLength(1);
+      expect(result.nodes.filter((n) => n.kind === 'struct' && n.name.startsWith('Vec.')).map((n) => n.name).sort()).toEqual([
+        'Vec.Bool',
+        'Vec.Int',
+      ]);
+    });
+  });
+
   describe('Type synonym and newtype extraction', () => {
     it('should extract type synonyms as type aliases', () => {
       const code = `module M where

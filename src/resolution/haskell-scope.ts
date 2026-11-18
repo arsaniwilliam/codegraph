@@ -30,6 +30,9 @@ const TARGET_KINDS: Partial<Record<UnresolvedRef['referenceKind'], ReadonlySet<N
   instantiates: new Set<NodeKind>(['enum_member']),
   // The constructors a pattern matches (the Haskell extractor's only `references`).
   references: new Set<NodeKind>(['enum_member']),
+  // An instance's class, or the type/data family an associated instance
+  // (`type F Foo = …`, `data F Foo = …`) instantiates.
+  implements: new Set<NodeKind>(['trait', 'type_alias', 'struct']),
 };
 
 /** Kinds that own children an import list can admit with `T(..)`. */
